@@ -18,10 +18,53 @@ export interface TelegramChannelOpts {
   registeredGroups: () => Record<string, RegisteredGroup>;
 }
 
+const RETRYABLE_CODES = new Set([
+  'ETIMEDOUT',
+  'ECONNRESET',
+  'ECONNREFUSED',
+  'ENOTFOUND',
+  'EAI_AGAIN',
+  'UND_ERR_CONNECT_TIMEOUT',
+]);
+const MAX_RETRIES = 3;
+const BASE_DELAY_MS = 1000;
+
+function isRetryable(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const code = (err as any).error?.code || (err as any).code;
+  if (code && RETRYABLE_CODES.has(code)) return true;
+  // Retry on 429 (rate limit) and 5xx server errors
+  const status = (err as any).error?.error_code || (err as any).status;
+  if (typeof status === 'number' && (status === 429 || status >= 500))
+    return true;
+  return false;
+}
+
+async function withRetry<T>(fn: () => Promise<T>, label: string): Promise<T> {
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (attempt < MAX_RETRIES && isRetryable(err)) {
+        const delay = BASE_DELAY_MS * 2 ** attempt;
+        logger.warn(
+          { attempt: attempt + 1, delay, err },
+          `${label} failed, retrying`,
+        );
+        await new Promise((r) => setTimeout(r, delay));
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw new Error('unreachable');
+}
+
 /**
  * Send a message with Telegram Markdown parse mode, falling back to plain text.
  * Claude's output naturally matches Telegram's Markdown v1 format:
  *   *bold*, _italic_, `code`, ```code blocks```, [links](url)
+ * Retries on transient network errors with exponential backoff.
  */
 async function sendTelegramMessage(
   api: { sendMessage: Api['sendMessage'] },
@@ -30,14 +73,17 @@ async function sendTelegramMessage(
   options: { message_thread_id?: number } = {},
 ): Promise<void> {
   try {
-    await api.sendMessage(chatId, text, {
-      ...options,
-      parse_mode: 'Markdown',
-    });
+    await withRetry(
+      () => api.sendMessage(chatId, text, { ...options, parse_mode: 'Markdown' }),
+      'Telegram sendMessage (Markdown)',
+    );
   } catch (err) {
     // Fallback: send as plain text if Markdown parsing fails
     logger.debug({ err }, 'Markdown send failed, falling back to plain text');
-    await api.sendMessage(chatId, text, options);
+    await withRetry(
+      () => api.sendMessage(chatId, text, options),
+      'Telegram sendMessage (plain)',
+    );
   }
 }
 
